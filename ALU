@@ -1,0 +1,355 @@
+// 32-bit ALU with single clock latency
+// Deliberately unoptimized coding style
+//
+// Operations (opcode[4:0]):
+//   5'b00000 : ADD
+//   5'b00001 : SUB
+//   5'b00010 : AND
+//   5'b00011 : OR
+//   5'b00100 : XOR
+//   5'b00101 : NAND
+//   5'b00110 : NOR
+//   5'b00111 : XNOR
+//   5'b01000 : NOT A
+//   5'b01001 : NOT B
+//   5'b01010 : SLL  (shift left logical)
+//   5'b01011 : SRL  (shift right logical)
+//   5'b01100 : SRA  (shift right arithmetic)
+//   5'b01101 : SLT  (set if A < B, signed)
+//   5'b01110 : SLTU (set if A < B, unsigned)
+//   5'b01111 : SEQ  (set if A == B)
+//   5'b10000 : SGT  (set if A > B, signed)
+//   5'b10001 : MUL_LO (lower 32 bits of unsigned 32x32 multiply)
+//   5'b10010 : PASS_A
+//   5'b10011 : PASS_B
+//   5'b10100 : ABS_DIFF (|A - B|)
+//   5'b10101 : MAX  (signed max of A, B)
+//   5'b10110 : MIN  (signed min of A, B)
+//   5'b10111 : BITREV_A (bit-reverse of A)
+//   5'b11000 : POPCOUNT_A (count of 1-bits in A)
+
+module alu_unopt (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [4:0]  opcode,
+    input  wire [31:0] a,
+    input  wire [31:0] b,
+    output reg  [31:0] result,
+    output reg         carry_out,
+    output reg         overflow,
+    output reg         zero_flag,
+    output reg         neg_flag
+);
+
+    // ---------------------------------------------------------------
+    // Intermediate combinational signals — many are redundant
+    // ---------------------------------------------------------------
+
+    // --- ADD: manual ripple carry adder instead of using + ---
+    wire [31:0] sum_manual;
+    wire [32:0] carry_chain;
+
+    assign carry_chain[0] = 1'b0;
+
+    genvar gi;
+    generate
+        for (gi = 0; gi < 32; gi = gi + 1) begin : ripple_add
+            assign sum_manual[gi]     = a[gi] ^ b[gi] ^ carry_chain[gi];
+            assign carry_chain[gi+1]  = (a[gi] & b[gi]) |
+                                        (a[gi] & carry_chain[gi]) |
+                                        (b[gi] & carry_chain[gi]);
+        end
+    endgenerate
+
+    wire add_carry_out = carry_chain[32];
+
+    // Overflow for signed ADD: sign(a)==sign(b) but sign(sum)!=sign(a)
+    wire add_overflow = (~a[31] & ~b[31] &  sum_manual[31]) |
+                        ( a[31] &  b[31] & ~sum_manual[31]);
+
+    // --- SUB: compute via redundant negation + add instead of a-b ---
+    // Compute ~b + 1 manually (two's complement), then add to a
+    wire [31:0] b_inv;
+    wire [31:0] neg_b;
+    wire [32:0] neg_carry;
+
+    assign b_inv = ~b;  // bitwise NOT
+
+    assign neg_carry[0] = 1'b1;  // +1 for two's complement
+    genvar gj;
+    generate
+        for (gj = 0; gj < 32; gj = gj + 1) begin : twos_comp
+            assign neg_b[gj]       = b_inv[gj] ^ neg_carry[gj];
+            assign neg_carry[gj+1] = b_inv[gj] & neg_carry[gj];
+        end
+    endgenerate
+
+    // Now add a + neg_b using yet another ripple carry (duplicate logic)
+    wire [31:0] diff_manual;
+    wire [32:0] diff_carry_chain;
+
+    assign diff_carry_chain[0] = 1'b0;
+
+    genvar gk;
+    generate
+        for (gk = 0; gk < 32; gk = gk + 1) begin : ripple_sub
+            assign diff_manual[gk]       = a[gk] ^ neg_b[gk] ^ diff_carry_chain[gk];
+            assign diff_carry_chain[gk+1]= (a[gk] & neg_b[gk]) |
+                                           (a[gk] & diff_carry_chain[gk]) |
+                                           (neg_b[gk] & diff_carry_chain[gk]);
+        end
+    endgenerate
+
+    wire sub_carry_out = diff_carry_chain[32];
+    // Overflow for signed SUB
+    wire sub_overflow = (~a[31] &  b[31] &  diff_manual[31]) |
+                        ( a[31] & ~b[31] & ~diff_manual[31]);
+
+    // --- Bitwise ops: each computed separately even when not needed ---
+    wire [31:0] and_result  = a & b;
+    wire [31:0] or_result   = a | b;
+    wire [31:0] xor_result  = a ^ b;
+    wire [31:0] nand_result = ~(a & b);
+    wire [31:0] nor_result  = ~(a | b);
+    wire [31:0] xnor_result = ~(a ^ b);
+    wire [31:0] not_a       = ~a;
+    wire [31:0] not_b       = ~b;
+
+    // --- Shifts: unrolled barrel shifter using cascaded muxes ---
+    // Logical left shift
+    wire [31:0] sll_s0  = b[0] ? {a[30:0], 1'b0}          : a;
+    wire [31:0] sll_s1  = b[1] ? {sll_s0[29:0], 2'b00}    : sll_s0;
+    wire [31:0] sll_s2  = b[2] ? {sll_s1[27:0], 4'b0000}  : sll_s1;
+    wire [31:0] sll_s3  = b[3] ? {sll_s2[23:0], 8'b0}     : sll_s2;
+    wire [31:0] sll_s4  = b[4] ? {sll_s3[15:0], 16'b0}    : sll_s3;
+    wire [31:0] sll_result = sll_s4;
+
+    // Logical right shift (redundant copy of the pattern)
+    wire [31:0] srl_s0  = b[0] ? {1'b0,  a[31:1]}          : a;
+    wire [31:0] srl_s1  = b[1] ? {2'b00, srl_s0[31:2]}     : srl_s0;
+    wire [31:0] srl_s2  = b[2] ? {4'b0,  srl_s1[31:4]}     : srl_s1;
+    wire [31:0] srl_s3  = b[3] ? {8'b0,  srl_s2[31:8]}     : srl_s2;
+    wire [31:0] srl_s4  = b[4] ? {16'b0, srl_s3[31:16]}    : srl_s3;
+    wire [31:0] srl_result = srl_s4;
+
+    // Arithmetic right shift: duplicate of SRL but fill with sign bit
+    wire        sign_a  = a[31];
+    wire [31:0] sra_s0  = b[0] ? {sign_a,        a[31:1]}                      : a;
+    wire [31:0] sra_s1  = b[1] ? {{2{sign_a}},   sra_s0[31:2]}                 : sra_s0;
+    wire [31:0] sra_s2  = b[2] ? {{4{sign_a}},   sra_s1[31:4]}                 : sra_s1;
+    wire [31:0] sra_s3  = b[3] ? {{8{sign_a}},   sra_s2[31:8]}                 : sra_s2;
+    wire [31:0] sra_s4  = b[4] ? {{16{sign_a}},  sra_s3[31:16]}                : sra_s3;
+    wire [31:0] sra_result = sra_s4;
+
+    // --- Comparison ---
+    wire        a_lt_b_signed   = ($signed(a) < $signed(b));
+    wire        a_lt_b_unsigned = (a < b);
+    wire        a_eq_b          = (a == b);
+    wire        a_gt_b_signed   = ($signed(a) > $signed(b));
+
+    wire [31:0] slt_result  = {31'b0, a_lt_b_signed};
+    wire [31:0] sltu_result = {31'b0, a_lt_b_unsigned};
+    wire [31:0] seq_result  = {31'b0, a_eq_b};
+    wire [31:0] sgt_result  = {31'b0, a_gt_b_signed};
+
+    // --- Unsigned 32x32 multiply (lower 32 bits) ---
+    // Deliberately using a sequential-style manual shift-add chain
+    // instead of a single * operator
+    wire [63:0] mul_pp [0:31];
+    genvar gm;
+    generate
+        for (gm = 0; gm < 32; gm = gm + 1) begin : mul_pp_gen
+            assign mul_pp[gm] = b[gm] ? ({32'b0, a} << gm) : 64'b0;
+        end
+    endgenerate
+
+    // Redundant tree: add partial products pairwise
+    wire [63:0] mul_l1 [0:15];
+    wire [63:0] mul_l2 [0:7];
+    wire [63:0] mul_l3 [0:3];
+    wire [63:0] mul_l4 [0:1];
+    wire [63:0] mul_l5;
+
+    genvar gp;
+    generate
+        for (gp = 0; gp < 16; gp = gp + 1) begin : mul_l1_gen
+            assign mul_l1[gp] = mul_pp[2*gp] + mul_pp[2*gp+1];
+        end
+        for (gp = 0; gp < 8; gp = gp + 1) begin : mul_l2_gen
+            assign mul_l2[gp] = mul_l1[2*gp] + mul_l1[2*gp+1];
+        end
+        for (gp = 0; gp < 4; gp = gp + 1) begin : mul_l3_gen
+            assign mul_l3[gp] = mul_l2[2*gp] + mul_l2[2*gp+1];
+        end
+        for (gp = 0; gp < 2; gp = gp + 1) begin : mul_l4_gen
+            assign mul_l4[gp] = mul_l3[2*gp] + mul_l3[2*gp+1];
+        end
+    endgenerate
+    assign mul_l5 = mul_l4[0] + mul_l4[1];
+
+    wire [31:0] mul_lo_result = mul_l5[31:0];
+
+    // --- ABS_DIFF: |A - B| using redundant if-else logic ---
+    wire [31:0] abs_diff_result;
+    wire        a_ge_b_signed = ($signed(a) >= $signed(b));
+    // Compute both a-b and b-a, then pick
+    wire [31:0] a_minus_b = a + (~b + 32'd1);
+    wire [31:0] b_minus_a = b + (~a + 32'd1);
+    assign abs_diff_result = a_ge_b_signed ? a_minus_b : b_minus_a;
+
+    // --- MAX / MIN ---
+    wire [31:0] max_result = a_gt_b_signed ? a : b;
+    wire [31:0] min_result = a_lt_b_signed ? a : b;
+
+    // --- BITREV_A: bit-reverse of A, unrolled manually ---
+    wire [31:0] bitrev_result;
+    assign bitrev_result[ 0] = a[31];
+    assign bitrev_result[ 1] = a[30];
+    assign bitrev_result[ 2] = a[29];
+    assign bitrev_result[ 3] = a[28];
+    assign bitrev_result[ 4] = a[27];
+    assign bitrev_result[ 5] = a[26];
+    assign bitrev_result[ 6] = a[25];
+    assign bitrev_result[ 7] = a[24];
+    assign bitrev_result[ 8] = a[23];
+    assign bitrev_result[ 9] = a[22];
+    assign bitrev_result[10] = a[21];
+    assign bitrev_result[11] = a[20];
+    assign bitrev_result[12] = a[19];
+    assign bitrev_result[13] = a[18];
+    assign bitrev_result[14] = a[17];
+    assign bitrev_result[15] = a[16];
+    assign bitrev_result[16] = a[15];
+    assign bitrev_result[17] = a[14];
+    assign bitrev_result[18] = a[13];
+    assign bitrev_result[19] = a[12];
+    assign bitrev_result[20] = a[11];
+    assign bitrev_result[21] = a[10];
+    assign bitrev_result[22] = a[ 9];
+    assign bitrev_result[23] = a[ 8];
+    assign bitrev_result[24] = a[ 7];
+    assign bitrev_result[25] = a[ 6];
+    assign bitrev_result[26] = a[ 5];
+    assign bitrev_result[27] = a[ 4];
+    assign bitrev_result[28] = a[ 3];
+    assign bitrev_result[29] = a[ 2];
+    assign bitrev_result[30] = a[ 1];
+    assign bitrev_result[31] = a[ 0];
+
+    // --- POPCOUNT: manual 2-bit adders then 4-bit, etc. (verbose tree) ---
+    wire [1:0] pc_l1 [0:15];
+    wire [2:0] pc_l2 [0:7];
+    wire [3:0] pc_l3 [0:3];
+    wire [4:0] pc_l4 [0:1];
+    wire [5:0] pc_l5;
+
+    genvar gc;
+    generate
+        for (gc = 0; gc < 16; gc = gc + 1) begin : pc_l1_gen
+            assign pc_l1[gc] = {1'b0, a[2*gc]} + {1'b0, a[2*gc+1]};
+        end
+        for (gc = 0; gc < 8; gc = gc + 1) begin : pc_l2_gen
+            assign pc_l2[gc] = {1'b0, pc_l1[2*gc]} + {1'b0, pc_l1[2*gc+1]};
+        end
+        for (gc = 0; gc < 4; gc = gc + 1) begin : pc_l3_gen
+            assign pc_l3[gc] = {1'b0, pc_l2[2*gc]} + {1'b0, pc_l2[2*gc+1]};
+        end
+        for (gc = 0; gc < 2; gc = gc + 1) begin : pc_l4_gen
+            assign pc_l4[gc] = {1'b0, pc_l3[2*gc]} + {1'b0, pc_l3[2*gc+1]};
+        end
+    endgenerate
+    assign pc_l5 = {1'b0, pc_l4[0]} + {1'b0, pc_l4[1]};
+
+    wire [31:0] popcount_result = {26'b0, pc_l5};
+
+    // ---------------------------------------------------------------
+    // Combinational result mux — long if-else chain (poor practice)
+    // ---------------------------------------------------------------
+    reg [31:0] comb_result;
+    reg        comb_carry;
+    reg        comb_overflow;
+
+    always @(*) begin
+        comb_result   = 32'b0;
+        comb_carry    = 1'b0;
+        comb_overflow = 1'b0;
+
+        if (opcode == 5'b00000) begin
+            comb_result   = sum_manual;
+            comb_carry    = add_carry_out;
+            comb_overflow = add_overflow;
+        end else if (opcode == 5'b00001) begin
+            comb_result   = diff_manual;
+            comb_carry    = sub_carry_out;
+            comb_overflow = sub_overflow;
+        end else if (opcode == 5'b00010) begin
+            comb_result = and_result;
+        end else if (opcode == 5'b00011) begin
+            comb_result = or_result;
+        end else if (opcode == 5'b00100) begin
+            comb_result = xor_result;
+        end else if (opcode == 5'b00101) begin
+            comb_result = nand_result;
+        end else if (opcode == 5'b00110) begin
+            comb_result = nor_result;
+        end else if (opcode == 5'b00111) begin
+            comb_result = xnor_result;
+        end else if (opcode == 5'b01000) begin
+            comb_result = not_a;
+        end else if (opcode == 5'b01001) begin
+            comb_result = not_b;
+        end else if (opcode == 5'b01010) begin
+            comb_result = sll_result;
+        end else if (opcode == 5'b01011) begin
+            comb_result = srl_result;
+        end else if (opcode == 5'b01100) begin
+            comb_result = sra_result;
+        end else if (opcode == 5'b01101) begin
+            comb_result = slt_result;
+        end else if (opcode == 5'b01110) begin
+            comb_result = sltu_result;
+        end else if (opcode == 5'b01111) begin
+            comb_result = seq_result;
+        end else if (opcode == 5'b10000) begin
+            comb_result = sgt_result;
+        end else if (opcode == 5'b10001) begin
+            comb_result = mul_lo_result;
+        end else if (opcode == 5'b10010) begin
+            comb_result = a;
+        end else if (opcode == 5'b10011) begin
+            comb_result = b;
+        end else if (opcode == 5'b10100) begin
+            comb_result = abs_diff_result;
+        end else if (opcode == 5'b10101) begin
+            comb_result = max_result;
+        end else if (opcode == 5'b10110) begin
+            comb_result = min_result;
+        end else if (opcode == 5'b10111) begin
+            comb_result = bitrev_result;
+        end else if (opcode == 5'b11000) begin
+            comb_result = popcount_result;
+        end else begin
+            comb_result = 32'b0;
+        end
+    end
+
+    // ---------------------------------------------------------------
+    // Output registers — single clock latency
+    // ---------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            result    <= 32'b0;
+            carry_out <= 1'b0;
+            overflow  <= 1'b0;
+            zero_flag <= 1'b0;
+            neg_flag  <= 1'b0;
+        end else begin
+            result    <= comb_result;
+            carry_out <= comb_carry;
+            overflow  <= comb_overflow;
+            zero_flag <= (comb_result == 32'b0);
+            neg_flag  <= comb_result[31];
+        end
+    end
+
+endmodule
