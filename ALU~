@@ -1,4 +1,5 @@
 // 32-bit ALU with single clock latency
+// Deliberately unoptimized coding style
 //
 // Operations (opcode[4:0]):
 //   5'b00000 : ADD
