@@ -20,3 +20,33 @@ module synchronizer_2ff (
     assign sync_out = ff2;
 
 endmodule
+
+
+//added 3ff code
+
+
+
+module sync_3ff (
+    input  wire clk,
+    input  wire rst_n,      // active-low reset
+    input  wire async_in,   // asynchronous input
+    output wire sync_out    // synchronized output
+);
+
+    reg ff1, ff2, ff3;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ff1 <= 1'b0;
+            ff2 <= 1'b0;
+            ff3 <= 1'b0;
+        end else begin
+            ff1 <= async_in;
+            ff2 <= ff1;
+            ff3 <= ff2;
+        end
+    end
+
+    assign sync_out = ff3;
+
+endmodule
